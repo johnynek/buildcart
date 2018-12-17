@@ -1,7 +1,7 @@
 package org.bykn.buildcart
 
 import org.scalatest.FunSuite
-import cats.{Applicative, Monad}
+import cats.Applicative
 
 import cats.implicits._
 
@@ -22,7 +22,6 @@ class BuildCartTest extends FunSuite {
     }
 
     val tasks = Tasks("b1" -> b1, "b2" -> b2)
-    val tasksM = Tasks[Monad, String, Int]("b1" -> b1, "b2" -> b2)
   }
 
 
@@ -60,8 +59,13 @@ class BuildCartTest extends FunSuite {
         def hash(i: Int): Hash[Int] = IntHash(i)
       }
 
-    val res1 = Build.shake[String, Int].update(tasksM, "b2", store1)
+    val res1 = Build.shake[String, Int].update(tasks, "b2", store1)
     assert(res1.getValue("b1") == 30)
     assert(res1.getValue("b2") == 60)
+    // rebuilding does not change the store
+    val res2 = Build.shake[String, Int].update(tasks, "b2", res1)
+    assert(res2 == res1)
+    assert(res2.getValue("b1") == 30)
+    assert(res2.getValue("b2") == 60)
   }
 }

@@ -7,6 +7,9 @@ import scala.collection.immutable.SortedSet
 import cats.implicits._
 
 object BuildCart {
+  /**
+   * This is (currently) an opaque value that we use the equals method on
+   */
   trait Hash[A]
 
   /**
@@ -34,6 +37,9 @@ object BuildCart {
       }
   }
 
+  /**
+   * A typeclass for hashing values.
+   */
   trait Hashable[A] {
     def hash(a: A): Hash[A]
   }
@@ -43,6 +49,11 @@ object BuildCart {
       h.hash(a)
   }
 
+  /**
+   * the state of the build system. There is an
+   * extended that value I, and also a mapping for
+   * all keys to the values that have been built
+   */
   trait Store[I, K, V] {
     def getInfo: I
     def putInfo(i: I): Store[I, K, V]
@@ -70,6 +81,11 @@ object BuildCart {
       StoreImpl(i, Map.empty, fn)
   }
 
+  /**
+   * this is a doubly higher kinded function for transforming
+   * constraints (e.g. MonadState to Monad or Monad to Applicative,
+   * ApplicativeError to Applicative, etc...
+   */
   trait FunctionKK[A[_[_]], B[_[_]]] {
     def apply[F[_]](a: A[F]): B[F]
   }
@@ -80,6 +96,11 @@ object BuildCart {
    *
    * These are the "targets" or "rules" of your build
    * system
+   *
+   * Tasks are contravariant in the context, this means
+   * if you have a Task[Applicative, K, V], you can consider
+   * it as a Task[Monad, K, V]: we can always run in a more
+   * powerful context.
    */
   trait Task[-Ctx[_[_]], +K, V] { self =>
     def run[F[_]](build: K => F[V])(implicit c: Ctx[F]): F[V]
@@ -242,19 +263,23 @@ object BuildCart {
     def empty[K, V]: VT[K, V] = VTImpl(Map.empty)
   }
 
-  sealed trait Tasks[Ctx[_[_]], K, V] {
+  /**
+   * This is just an alias for a map of Tasks
+   */
+  sealed trait Tasks[-Ctx[_[_]], K, V] {
     def get(k: K): Option[Task[Ctx, K, V]]
-
-    def ++(that: Tasks[Ctx, K, V]): Tasks[Ctx, K, V]
   }
 
   object Tasks {
+    implicit class InvariantTasks[Ctx[_[_]], K, V](val tasks: Tasks[Ctx, K, V]) extends AnyVal {
+      def ++(that: Tasks[Ctx, K, V]): Tasks[Ctx, K, V] =
+        (tasks, that) match {
+          case (TaskMap(m1), TaskMap(m2)) => TaskMap(m1 ++ m2)
+        }
+    }
+
     private case class TaskMap[Ctx[_[_]], K, V](toMap: Map[K, Task[Ctx, K, V]]) extends Tasks[Ctx, K, V] {
       def get(k: K) = toMap.get(k)
-      def ++(that: Tasks[Ctx, K, V]): Tasks[Ctx, K, V] =
-        that match {
-          case TaskMap(m2) => TaskMap(toMap ++ m2)
-        }
     }
     def one[Ctx[_[_]], K, V](k: K, t: Task[Ctx, K, V]): Tasks[Ctx, K, V] =
       TaskMap(Map((k, t)))
@@ -263,7 +288,10 @@ object BuildCart {
       TaskMap(Map(tasks: _*))
   }
 
-  trait Build[Ctx[_[_]], I, K, V] {
+  /**
+   * This runs a build for a given k by updating the state of the store
+   */
+  trait Build[+Ctx[_[_]], I, K, V] {
     def update(tsks: Tasks[Ctx, K, V], key: K, store: Store[I, K, V]): Store[I, K, V]
   }
 
@@ -289,11 +317,19 @@ object BuildCart {
         }
       }
 
+    /**
+     * This is a build, as defined in the paper, that implements
+     * Shake's approach of suspending scheduling and verifying rebuilding
+     */
     def shake[K: Order, V: Hashable]: Build[Monad, VT[K, V], K, V] =
       Scheduler.suspending[VT[K, V], K, V].schedule(Rebuilder.vtRebuilder[K, V])
   }
 
-  trait Rebuilder[Ctx[_[_]], IR, K, V] {
+  /**
+   * This is a type that defines how to decide when to rebuild a task from
+   * the current value
+   */
+  trait Rebuilder[+Ctx[_[_]], IR, K, V] {
     def apply(k: K, v: V, task: Task[Ctx, K, V]): Task.StateTask[IR, K, V]
   }
 
@@ -340,11 +376,18 @@ object BuildCart {
       }
   }
 
+  /**
+   * A scheduler computes the order in which to run a build. It is given
+   * a rebuilder in order to return a Build
+   */
   trait Scheduler[Ctx[_[_]], I, IR, K, V] {
     def schedule(r: Rebuilder[Ctx, IR, K, V]): Build[Ctx, I, K, V]
   }
 
   object Scheduler {
+    /**
+     * This is the suspending tactic described in the paper
+     */
     def suspending[I, K: Order, V]: Scheduler[Monad, I, I, K, V] =
       new Scheduler[Monad, I, I, K, V] {
         def schedule(r: Rebuilder[Monad, I, K, V]): Build[Monad, I, K, V] =
@@ -391,6 +434,4 @@ object BuildCart {
           }
       }
   }
-
-  case class Trace[+K, V, +R](key: K, depends: List[(K, Hash[V])], result: R)
 }
