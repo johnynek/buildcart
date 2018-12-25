@@ -1,7 +1,7 @@
 package org.bykn.buildcart
 
-import cats.{Applicative, Id, Eq, Monad, Order, Traverse}
-import cats.data.{Chain, Const, State, WriterT}
+import cats.{Applicative, Id, Eq, Functor, Monad, Monoid, Order, Traverse}
+import cats.data.{Chain, Const, State, StateT, WriterT}
 import scala.collection.immutable.SortedSet
 
 import cats.implicits._
@@ -81,6 +81,13 @@ object BuildCart {
       StoreImpl(i, Map.empty, fn)
   }
 
+  trait StoreM[M[_], I, K, V] {
+    def getInfo: M[I]
+    def putInfo(info: I): M[Unit]
+    def getValue(k: K)(implicit eqK: Eq[K]): M[V]
+    def putValue(k: K, v: V)(implicit eqK: Eq[K]): M[Unit]
+  }
+
   /**
    * this is a doubly higher kinded function for transforming
    * constraints (e.g. MonadState to Monad or Monad to Applicative,
@@ -88,6 +95,50 @@ object BuildCart {
    */
   trait FunctionKK[A[_[_]], B[_[_]]] {
     def apply[F[_]](a: A[F]): B[F]
+  }
+
+  trait Absorb[F[_], G[_]] {
+    def absorb[A](f: F[A]): G[A]
+    def absorb1[A](gf: G[F[A]]): G[A]
+  }
+
+  object Absorb {
+    implicit def absorbId[G[_]: Applicative]: Absorb[Id, G] =
+      new Absorb[Id, G] {
+        def absorb[A](a: A): G[A] = a.pure[G]
+        def absorb1[A](gf: G[A]): G[A] = gf
+      }
+
+    implicit def absorbStateT[M[_]: Monad, S]: Absorb[M, StateT[M, S, ?]] =
+      new Absorb[M, StateT[M, S, ?]] {
+        def absorb[A](a: M[A]): StateT[M, S, A] =
+          StateT.liftF(a)
+        def absorb1[A](gf: StateT[M, S, M[A]]): StateT[M, S, A] =
+          gf.flatMap(absorb(_))
+      }
+
+    implicit def absorbWriter[M[_]: Monad, L: Monoid]: Absorb[M, WriterT[M, L, ?]] =
+      new Absorb[M, WriterT[M, L, ?]] {
+        def absorb[A](a: M[A]): WriterT[M, L, A] =
+          WriterT.liftF(a)
+        def absorb1[A](gf: WriterT[M, L, M[A]]): WriterT[M, L, A] =
+          gf.flatMap(absorb(_))
+      }
+
+    def absorbConst[F[_], B](b: B): Absorb[F, Const[B, ?]] =
+      new Absorb[F, Const[B, ?]] {
+        val c = Const[B, Nothing](b)
+        def absorb[A](a: F[A]): Const[B, A] = c.retag
+        def absorb1[A](gf: Const[B, F[A]]): Const[B, A] = gf.retag[A]
+      }
+
+    def compose[F[_], G[_], H[_]: Functor](first: Absorb[F, G], second: Absorb[G, H]): Absorb[F, H] =
+      new Absorb[F, H] {
+        def absorb[A](a: F[A]): H[A] =
+          second.absorb(first.absorb(a))
+        def absorb1[A](gf: H[F[A]]): H[A] =
+          second.absorb1(gf.map { fa => first.absorb(fa) })
+      }
   }
 
   /**
@@ -102,119 +153,128 @@ object BuildCart {
    * it as a Task[Monad, K, V]: we can always run in a more
    * powerful context.
    */
-  trait Task[-Ctx[_[_]], +K, V] { self =>
-    def run[F[_]](build: K => F[V])(implicit c: Ctx[F]): F[V]
+  trait Task[-Ctx[_[_]], M[_], +K, V] { self =>
+    def run[F[_]](build: K => F[V])(implicit c: Ctx[F], a: Absorb[M, F]): F[V]
 
-    def map[K1](fn: K => K1): Task[Ctx, K1, V] =
-      new Task[Ctx, K1, V] {
-        def run[F[_]](build: K1 => F[V])(implicit c: Ctx[F]): F[V] =
+    def map[K1](fn: K => K1): Task[Ctx, M, K1, V] =
+      new Task[Ctx, M, K1, V] {
+        def run[F[_]](build: K1 => F[V])(implicit c: Ctx[F], a: Absorb[M, F]): F[V] =
           self.run(fn.andThen(build))
       }
   }
 
   object Task {
-    type StateTask[IR, K, V] = Task[({type MS[M[_]] = MonadState[M, IR]})#MS, K, V]
+    type StateTask[M[_], IR, K, V] = Task[({type MS[M1[_]] = MonadState[M1, IR]})#MS, M, K, V]
 
     /**
      * This builds a given key, not very useful except for defining a Monad on Task
      */
-    def key[Ctx[_[_]], K, V](k: K): Task[Ctx, K, V] =
-      new Task[Ctx, K, V] {
-        def run[F[_]](build: K => F[V])(implicit c: Ctx[F]): F[V] = build(k)
+    def key[Ctx[_[_]], M[_], K, V](k: K): Task[Ctx, M, K, V] =
+      new Task[Ctx, M, K, V] {
+        def run[F[_]](build: K => F[V])(implicit c: Ctx[F], a: Absorb[M, F]): F[V] = build(k)
       }
 
-    def value[V](value: => V): Task[Applicative, Nothing, V] =
-      new Task[Applicative, Nothing, V] {
-        def run[F[_]](build: Nothing => F[V])(implicit c: Applicative[F]): F[V] =
-          c.pure(value)
+    def value[M[_], V](value: M[V]): Task[Applicative, M, Nothing, V] =
+      new Task[Applicative, M, Nothing, V] {
+        def run[F[_]](build: Nothing => F[V])(implicit c: Applicative[F], a: Absorb[M, F]): F[V] =
+          a.absorb(value)
       }
 
-    implicit def taskMonad[Ctx[_[_]], V]: Monad[Task[Ctx, ?, V]] =
-      new Monad[Task[Ctx, ?, V]] {
-        def pure[A](a: A) = Task.key(a)
+    // implicit def taskMonad[Ctx[_[_]], V]: Monad[Task[Ctx, ?, V]] =
+    //   new Monad[Task[Ctx, ?, V]] {
+    //     def pure[A](a: A) = Task.key(a)
 
-        override def map[A, B](fa: Task[Ctx, A, V])(fn: A => B): Task[Ctx, B, V] =
-          fa.map(fn)
+    //     override def map[A, B](fa: Task[Ctx, A, V])(fn: A => B): Task[Ctx, B, V] =
+    //       fa.map(fn)
 
-        override def product[A, B](fa: Task[Ctx, A, V], fb: Task[Ctx, B, V]): Task[Ctx, (A, B), V] =
-          fa.product(fb)
+    //     override def product[A, B](fa: Task[Ctx, A, V], fb: Task[Ctx, B, V]): Task[Ctx, (A, B), V] =
+    //       fa.product(fb)
 
-        override def ap[A, B](fab: Task[Ctx, A => B, V])(fb: Task[Ctx, A, V]): Task[Ctx, B, V] =
-          product(fab, fb).map { case (f, b) => f(b) }
+    //     override def ap[A, B](fab: Task[Ctx, A => B, V])(fb: Task[Ctx, A, V]): Task[Ctx, B, V] =
+    //       product(fab, fb).map { case (f, b) => f(b) }
 
-        def flatMap[A, B](fa: Task[Ctx, A, V])(fn: A => Task[Ctx, B, V]): Task[Ctx, B, V] =
-          fa.flatMap(fn)
+    //     def flatMap[A, B](fa: Task[Ctx, A, V])(fn: A => Task[Ctx, B, V]): Task[Ctx, B, V] =
+    //       fa.flatMap(fn)
 
-        def tailRecM[A, B](a: A)(fn: A => Task[Ctx, Either[A, B], V]): Task[Ctx, B, V] =
-          new Task[Ctx, B, V] {
-            def run[F[_]](build: B => F[V])(implicit c: Ctx[F]): F[V] = {
-              // TODO: this is not really stack safe.
-              // if we had Ctx is Monad or Defer, I think we are
-              // okay here.
-              def go(a: A): F[V] =
-                fn(a).run {
-                  case Left(a) => go(a)
-                  case Right(b) => build(b)
-                }
+    //     def tailRecM[A, B](a: A)(fn: A => Task[Ctx, Either[A, B], V]): Task[Ctx, B, V] =
+    //       new Task[Ctx, B, V] {
+    //         def run[F[_]](build: B => F[V])(implicit c: Ctx[F]): F[V] = {
+    //           // TODO: this is not really stack safe.
+    //           // if we had Ctx is Monad or Defer, I think we are
+    //           // okay here.
+    //           def go(a: A): F[V] =
+    //             fn(a).run {
+    //               case Left(a) => go(a)
+    //               case Right(b) => build(b)
+    //             }
 
-              go(a)
-            }
-          }
-      }
+    //           go(a)
+    //         }
+    //       }
+    //   }
 
-    implicit class InvariantTask[Ctx[_[_]], K, V](val task: Task[Ctx, K, V]) extends AnyVal {
-      def reconstrain[Ctx2[_[_]]](fn: FunctionKK[Ctx2, Ctx]): Task[Ctx2, K, V] =
-        new Task[Ctx2, K, V] {
-          def run[F[_]](build: K => F[V])(implicit c: Ctx2[F]): F[V] =
-            task.run(build)(fn(c))
+    implicit class InvariantTask[Ctx[_[_]], M[_], K, V](val task: Task[Ctx, M, K, V]) extends AnyVal {
+      def reconstrain[Ctx2[_[_]]](fn: FunctionKK[Ctx2, Ctx]): Task[Ctx2, M, K, V] =
+        new Task[Ctx2, M, K, V] {
+          def run[F[_]](build: K => F[V])(implicit c: Ctx2[F], a: Absorb[M, F]): F[V] =
+            task.run(build)(fn(c), a)
         }
 
-      def flatMap[K1](fn: K => Task[Ctx, K1, V]): Task[Ctx, K1, V] =
-        new Task[Ctx, K1, V] {
-          def run[F[_]](build: K1 => F[V])(implicit c: Ctx[F]): F[V] =
+      def flatMap[K1](fn: K => Task[Ctx, M, K1, V]): Task[Ctx, M, K1, V] =
+        new Task[Ctx, M, K1, V] {
+          def run[F[_]](build: K1 => F[V])(implicit c: Ctx[F], a: Absorb[M, F]): F[V] =
             task.run { k =>
               fn(k).run(build)
             }
         }
 
-      type MapRes[F[_]] = (F[V], Ctx[F])
-      type IdK[F[_]] = F[V]
+      // type MapRes[F[_]] = (F[V], Ctx[F])
+      // type IdK[F[_]] = F[V]
 
-      def mapResult(fn: FunctionKK[MapRes, IdK]): Task[Ctx, K, V] =
-        new Task[Ctx, K, V] {
-          def run[F[_]](build: K => F[V])(implicit c: Ctx[F]): F[V] =
-            task.run { k =>
-              val fv = build(k)
-              fn((fv, c))
-            }
-        }
+      // def mapResult(fn: FunctionKK[MapRes, IdK]): Task[Ctx, M, K, V] =
+      //   new Task[Ctx, M, K, V] {
+      //     def run[F[_]](build: K => F[V])(implicit c: Ctx[F], a: Absorb[M, F]): F[V] =
+      //       task.run { k =>
+      //         val fv = build(k)
+      //         fn((fv, c))
+      //       }
+      //   }
 
-      def product[K1](that: Task[Ctx, K1, V]): Task[Ctx, (K, K1), V] =
-        new Task[Ctx, (K, K1), V] {
-          def run[F[_]](build: ((K, K1)) => F[V])(implicit c: Ctx[F]): F[V] =
-            task.run { a =>
-              that.run { b =>
-                build((a, b))
-              }
-            }
-        }
+      // def product[K1](that: Task[Ctx, K1, V]): Task[Ctx, (K, K1), V] =
+      //   new Task[Ctx, (K, K1), V] {
+      //     def run[F[_]](build: ((K, K1)) => F[V])(implicit c: Ctx[F]): F[V] =
+      //       task.run { a =>
+      //         that.run { b =>
+      //           build((a, b))
+      //         }
+      //       }
+      //   }
     }
 
-    implicit class ApplicativeTask[K, V](val task: Task[Applicative, K, V]) extends AnyVal {
+    implicit class ApplicativeTask[M[_], K, V](val task: Task[Applicative, M, K, V]) extends AnyVal {
       // Get the list of dependencies for a given K
       // I think this also works for Alternative
       def dependencies: List[K] =
-        task.run[Const[Chain[K], ?]] { k => Const(Chain.one(k)) }
+        task.run[Const[Chain[K], ?]] { k =>
+            Const(Chain.one(k))
+          }(implicitly, Absorb.absorbConst(Chain.empty))
           .getConst
           .toList
+
+      def absorb[M1[_]](implicit abs: Absorb[M, M1]): Task[Applicative, M1, K, V] =
+        new Task[Applicative, M1, K, V] {
+          def run[F[_]](build: K => F[V])(implicit c: Applicative[F], a: Absorb[M1, F]): F[V] =
+            task.run(build)(c, Absorb.compose(abs, a))
+        }
+
     }
 
-    implicit class MonadTask[K, V](val task: Task[Monad, K, V]) extends AnyVal {
-      // Run without attempting to update any dependencies
-      def compute[I](store: Store[I, K, V])(implicit EK: Eq[K]): V =
-        task.run[Id] { k => store.getValue(k) }
+    implicit class MonadTask[G[_], K, V](val task: Task[Monad, G, K, V]) extends AnyVal {
+      // // Run without attempting to update any dependencies
+      // def compute[I](store: Store[I, K, V])(implicit EK: Eq[K], abs: ): V =
+      //   task.run[Id] { k => store.getValue(k) }
 
-      def track[M[_]: Monad](fn: K => M[V]): M[(Chain[(K, V)], V)] = {
+      def track[M[_]: Monad](fn: K => M[V])(implicit a: Absorb[G, M]): M[(Chain[(K, V)], V)] = {
 
         def fetchTrack(k: K): WriterT[M, Chain[(K, V)], V] =
           for {
@@ -222,14 +282,17 @@ object BuildCart {
             _ <- WriterT.tell[M, Chain[(K, V)]](Chain.one((k, v)))
           } yield v
 
+        implicit val absW: Absorb[G, WriterT[M, Chain[(K, V)], ?]] =
+          Absorb.compose(a, Absorb.absorbWriter[M, Chain[(K, V)]])
+
         task.run(fetchTrack).run
       }
     }
 
-    def traverse[T[_]: Traverse, K, V](tasks: T[K])(fn: T[V] => V): Task[Applicative, K, V] =
-      new Task[Applicative, K, V] {
-        def run[F[_]](build: K => F[V])(implicit ctx: Applicative[F]): F[V] =
-          tasks.traverse(build).map(fn)
+    def traverse[T[_]: Traverse, M[_], K, V](tasks: T[K])(fn: T[V] => M[V]): Task[Applicative, M, K, V] =
+      new Task[Applicative, M, K, V] {
+        def run[F[_]](build: K => F[V])(implicit ctx: Applicative[F], a: Absorb[M, F]): F[V] =
+          a.absorb1(tasks.traverse(build).map(fn))
       }
   }
 
@@ -266,54 +329,62 @@ object BuildCart {
   /**
    * This is just an alias for a map of Tasks
    */
-  sealed trait Tasks[-Ctx[_[_]], K, V] {
-    def get(k: K): Option[Task[Ctx, K, V]]
+  sealed trait Tasks[-Ctx[_[_]], M[_], K, V] {
+    def get(k: K): Option[Task[Ctx, M, K, V]]
   }
 
   object Tasks {
-    implicit class InvariantTasks[Ctx[_[_]], K, V](val tasks: Tasks[Ctx, K, V]) extends AnyVal {
-      def ++(that: Tasks[Ctx, K, V]): Tasks[Ctx, K, V] =
+    implicit class InvariantTasks[Ctx[_[_]], M[_], K, V](val tasks: Tasks[Ctx, M, K, V]) extends AnyVal {
+      def ++(that: Tasks[Ctx, M, K, V]): Tasks[Ctx, M, K, V] =
         (tasks, that) match {
           case (TaskMap(m1), TaskMap(m2)) => TaskMap(m1 ++ m2)
         }
     }
 
-    private case class TaskMap[Ctx[_[_]], K, V](toMap: Map[K, Task[Ctx, K, V]]) extends Tasks[Ctx, K, V] {
-      def get(k: K) = toMap.get(k)
+    implicit class ApplicativeTasks[M[_], K, V](val tasks: Tasks[Applicative, M, K, V]) extends AnyVal {
+      def absorb[M1[_]](implicit a: Absorb[M, M1]): Tasks[Applicative, M1, K, V] =
+        tasks match {
+          case TaskMap(m) => TaskMap(m.map { case (k, t) => (k, t.absorb[M1]) })
+        }
     }
-    def one[Ctx[_[_]], K, V](k: K, t: Task[Ctx, K, V]): Tasks[Ctx, K, V] =
+
+    private case class TaskMap[Ctx[_[_]], M[_], K, V](
+      toMap: Map[K, Task[Ctx, M, K, V]]) extends Tasks[Ctx, M, K, V] {
+        def get(k: K) = toMap.get(k)
+      }
+    def one[Ctx[_[_]], M[_], K, V](k: K, t: Task[Ctx, M, K, V]): Tasks[Ctx, M, K, V] =
       TaskMap(Map((k, t)))
 
-    def apply[Ctx[_[_]], K, V](tasks: (K, Task[Ctx, K, V])*): Tasks[Ctx, K, V] =
+    def apply[Ctx[_[_]], M[_], K, V](tasks: (K, Task[Ctx, M, K, V])*): Tasks[Ctx, M, K, V] =
       TaskMap(Map(tasks: _*))
   }
 
   /**
    * This runs a build for a given k by updating the state of the store
    */
-  trait Build[+Ctx[_[_]], I, K, V] {
-    def update(tsks: Tasks[Ctx, K, V], key: K, store: Store[I, K, V]): Store[I, K, V]
+  trait Build[+Ctx[_[_]], M[_], I, K, V] {
+    def update(tsks: Tasks[Ctx, M, K, V], key: K, store: Store[I, K, V]): M[Store[I, K, V]]
   }
 
   object Build {
     /**
      * A naive applicative builder that rebuilds each time an item is needed
      */
-    def busy[K: Eq, V]: Build[Applicative, Unit, K, V] =
-      new Build[Applicative, Unit, K, V] {
-        def update(tsks: Tasks[Applicative, K, V], key: K, store: Store[Unit, K, V]): Store[Unit, K, V] = {
-
-          def fetch(k: K): State[Store[Unit, K, V], V] =
+    def busy[M[_]: Monad, K: Eq, V]: Build[Applicative, M, Unit, K, V] =
+      new Build[Applicative, M, Unit, K, V] {
+        def update(tsks: Tasks[Applicative, M, K, V], key: K, store: Store[Unit, K, V]): M[Store[Unit, K, V]] = {
+          def fetch(k: K): StateT[M, Store[Unit, K, V], V] =
             tsks.get(k) match {
-              case None => State.get[Store[Unit, K, V]].map(_.getValue(k))
+              case None => StateT.get[M, Store[Unit, K, V]].map(_.getValue(k))
               case Some(t) =>
                 for {
                   v <- t.run(fetch(_))
-                  _ <- State.modify[Store[Unit, K, V]](_.putValue(k, v))
+                  _ <- StateT.modify[M, Store[Unit, K, V]](_.putValue(k, v))
                 } yield v
             }
 
-          fetch(key).run(store).value._1
+
+          fetch(key).runS(store)
         }
       }
 
@@ -321,26 +392,33 @@ object BuildCart {
      * This is a build, as defined in the paper, that implements
      * Shake's approach of suspending scheduling and verifying rebuilding
      */
-    def shake[K: Order, V: Hashable]: Build[Monad, VT[K, V], K, V] =
-      Scheduler.suspending[VT[K, V], K, V].schedule(Rebuilder.vtRebuilder[K, V])
+    def shake[M[_]: Monad, K: Order, V: Hashable]: Build[Monad, M, VT[K, V], K, V] =
+      Scheduler.suspending[M, VT[K, V], K, V].schedule(Rebuilder.vtRebuilder[M, K, V])
   }
 
   /**
    * This is a type that defines how to decide when to rebuild a task from
    * the current value
    */
-  trait Rebuilder[+Ctx[_[_]], IR, K, V] {
-    def apply(k: K, v: V, task: Task[Ctx, K, V]): Task.StateTask[IR, K, V]
+  trait Rebuilder[+Ctx[_[_]], M[_], IR, K, V] {
+    def apply(k: K, v: V, task: Task[Ctx, M, K, V]): Task.StateTask[M, IR, K, V]
   }
 
   object Rebuilder {
-    def dirtyBit[K, V]: Rebuilder[Monad, K => Boolean, K, V] =
-      new Rebuilder[Monad, K => Boolean, K, V] {
-        def apply(k: K, v: V, task: Task[Monad, K, V]): Task.StateTask[K => Boolean, K, V] =
-          new Task.StateTask[K => Boolean, K, V] {
-            def run[F[_]](build: K => F[V])(implicit c: MonadState[F, K => Boolean]): F[V] =
+    implicit class ApplicativeRebuilder[M[_], IR, K, V](val rebuilder: Rebuilder[Applicative, M, IR, K, V]) extends AnyVal {
+      def shouldRebuild(k: K, v: V, task: Task[Applicative, M, K, V], ir: IR): List[K] = {
+        val stateTask = rebuilder(k, v, task)
+        ???
+      }
+    }
+
+    def dirtyBit[M[_], K, V]: Rebuilder[Monad, M, K => Boolean, K, V] =
+      new Rebuilder[Monad, M, K => Boolean, K, V] {
+        def apply(k: K, v: V, task: Task[Monad, M, K, V]): Task.StateTask[M, K => Boolean, K, V] =
+          new Task.StateTask[M, K => Boolean, K, V] {
+            def run[F[_]](build: K => F[V])(implicit c: MonadState[F, K => Boolean], a: Absorb[M, F]): F[V] =
               c.monad.flatMap(c.get) { isDirty =>
-                if (isDirty(k)) task.run(build)(c.monad)
+                if (isDirty(k)) task.run(build)(c.monad, a)
                 else c.monad.pure(v)
             }
           }
@@ -349,11 +427,11 @@ object BuildCart {
     /**
      * This is the verifying trace rebuilder
      */
-    def vtRebuilder[K, V: Hashable]: Rebuilder[Monad, VT[K, V], K, V] =
-      new Rebuilder[Monad, VT[K, V], K, V] {
-        def apply(k: K, v: V, task: Task[Monad, K, V]): Task.StateTask[VT[K, V], K, V] =
-          new Task.StateTask[VT[K, V], K, V] {
-            def run[F[_]](build: K => F[V])(implicit c: MonadState[F, VT[K, V]]): F[V] = {
+    def vtRebuilder[M[_], K, V: Hashable]: Rebuilder[Monad, M, VT[K, V], K, V] =
+      new Rebuilder[Monad, M, VT[K, V], K, V] {
+        def apply(k: K, v: V, task: Task[Monad, M, K, V]): Task.StateTask[M, VT[K, V], K, V] =
+          new Task.StateTask[M, VT[K, V], K, V] {
+            def run[F[_]](build: K => F[V])(implicit c: MonadState[F, VT[K, V]], a: Absorb[M, F]): F[V] = {
               implicit val monad = c.monad
 
               def rebuild: F[V] =
@@ -380,38 +458,38 @@ object BuildCart {
    * A scheduler computes the order in which to run a build. It is given
    * a rebuilder in order to return a Build
    */
-  trait Scheduler[Ctx[_[_]], I, IR, K, V] {
-    def schedule(r: Rebuilder[Ctx, IR, K, V]): Build[Ctx, I, K, V]
+  trait Scheduler[Ctx[_[_]], M[_], I, IR, K, V] {
+    def schedule(r: Rebuilder[Ctx, M, IR, K, V]): Build[Ctx, M, I, K, V]
   }
 
   object Scheduler {
     /**
      * This is the suspending tactic described in the paper
      */
-    def suspending[I, K: Order, V]: Scheduler[Monad, I, I, K, V] =
-      new Scheduler[Monad, I, I, K, V] {
-        def schedule(r: Rebuilder[Monad, I, K, V]): Build[Monad, I, K, V] =
-          new Build[Monad, I, K, V] {
+    def suspending[M[_]: Monad, I, K: Order, V]: Scheduler[Monad, M, I, I, K, V] =
+      new Scheduler[Monad, M, I, I, K, V] {
+        def schedule(r: Rebuilder[Monad, M, I, K, V]): Build[Monad, M, I, K, V] =
+          new Build[Monad, M, I, K, V] {
             type S = (Store[I, K, V], SortedSet[K])
-            val monadState: MonadState[State[S, ?], I] =
-              new MonadState[State[S, ?], I] {
-                def monad = Monad[State[S, ?]]
-                def update[A](fn: I => State[S, (I, A)]): State[S, A] =
+            val monadState: MonadState[StateT[M, S, ?], I] =
+              new MonadState[StateT[M, S, ?], I] {
+                def monad = Monad[StateT[M, S, ?]]
+                def update[A](fn: I => StateT[M, S, (I, A)]): StateT[M, S, A] =
                   for {
-                    sd <- State.get[S]
+                    sd <- StateT.get[M, S]
                     (store, _) = sd
                     ia <- fn(store.getInfo)
                     (newI, a) = ia
-                    _ <- State.modify[S] { case (store, d) => (store.putInfo(newI), d) }
+                    _ <- StateT.modify[M, S] { case (store, d) => (store.putInfo(newI), d) }
                   } yield a
               }
 
-            def update(tsks: Tasks[Monad, K, V], key: K, store: Store[I, K, V]): Store[I, K, V] = {
-              def run(t: Task.StateTask[I, K, V], fn: K => State[S, V]): State[S, V] =
-                t.run(fn)(monadState)
+            def update(tsks: Tasks[Monad, M, K, V], key: K, store: Store[I, K, V]): M[Store[I, K, V]] = {
+              def run(t: Task.StateTask[M, I, K, V], fn: K => StateT[M, S, V]): StateT[M, S, V] =
+                t.run(fn)(monadState, Absorb.absorbStateT)
 
-              def fetch(key: K): State[S, V] =
-                State.get[S]
+              def fetch(key: K): StateT[M, S, V] =
+                StateT.get[M, S]
                   .flatMap { case (store, done) =>
                     val value = store.getValue(key)
                     tsks.get(key) match {
@@ -420,16 +498,16 @@ object BuildCart {
                         val newTask = r(key, value, task)
                         for {
                           newValue <- run(newTask, fetch(_))
-                          _ <- State.modify[S] { case (str, set) =>
+                          _ <- StateT.modify[M, S] { case (str, set) =>
                             (str.putValue(key, newValue), set + key)
                           }
                         } yield newValue
                       case _ =>
-                        State.pure(value)
+                        StateT.pure(value)
                     }
                   }
 
-              fetch(key).run((store, SortedSet.empty[K](Order[K].toOrdering))).value._1._1
+              fetch(key).runS((store, SortedSet.empty[K](Order[K].toOrdering))).map(_._1)
             }
           }
       }
