@@ -164,7 +164,7 @@ object BuildCart {
   }
 
   object Task {
-    type StateTask[M[_], IR, K, V] = Task[({type MS[M1[_]] = MonadState[M1, IR]})#MS, M, K, V]
+    type StateTask[IR, K, V] = Task[λ[M[_] => MonadState[M, IR]], K, V]
 
     /**
      * This builds a given key, not very useful except for defining a Monad on Task
