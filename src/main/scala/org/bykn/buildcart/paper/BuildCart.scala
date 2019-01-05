@@ -1,4 +1,4 @@
-package org.bykn.buildcart
+package org.bykn.buildcart.paper
 
 import cats.{Applicative, Id, Eq, Monad, Order, Traverse}
 import cats.data.{Chain, Const, State, WriterT}
@@ -6,6 +6,10 @@ import scala.collection.immutable.SortedSet
 
 import cats.implicits._
 
+/**
+ * This is a faithful implementation of the build a la carte paper here
+ * as a reference or example
+ */
 object BuildCart {
   /**
    * This is (currently) an opaque value that we use the equals method on

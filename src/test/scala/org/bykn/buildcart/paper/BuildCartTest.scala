@@ -1,26 +1,34 @@
-package org.bykn.buildcart
+package org.bykn.buildcart.paper
 
 import org.scalatest.FunSuite
-import cats.{Applicative, Eval, Id}
+import cats.Applicative
 
 import cats.implicits._
 
-class BuildCartTest extends FunSuite {
-  object SpreadSheet1 {
-    type T = Task[Applicative, Id, String, Int]
+/**
+ * This tests the build a la cart paper, no custom changes should be here
+ * except as seen by porting to scala
+ */
+class PaperBuildCartTest extends FunSuite {
+  import BuildCart._
 
-    val b1: T = new Task[Applicative, Id, String, Int] {
-      def run[F[_]](build: String => F[Int])(implicit ctx: Applicative[F], a: Absorb[Id, F]): F[Int] =
+  object SpreadSheet1 {
+    type T = Task[Applicative, String, Int]
+
+    val b1: T = new Task[Applicative, String, Int] {
+      def run[F[_]](build: String => F[Int])(implicit ctx: Applicative[F]): F[Int] =
         (build("a1"), build("a2")).mapN(_ + _)
     }
 
-    val b2: T = new Task[Applicative, Id, String, Int] {
-      def run[F[_]](build: String => F[Int])(implicit ctx: Applicative[F], a: Absorb[Id, F]): F[Int] =
+    val b2: T = new Task[Applicative, String, Int] {
+      def run[F[_]](build: String => F[Int])(implicit ctx: Applicative[F]): F[Int] =
         build("b1").map(_ * 2)
     }
 
     val tasks = Tasks("b1" -> b1, "b2" -> b2)
   }
+
+
 
   test("SpreadSheet1 example build using busy") {
     import SpreadSheet1._
@@ -34,7 +42,7 @@ class BuildCartTest extends FunSuite {
       case _ => 0
     }
 
-    val res = Build.busy[Id, String, Int].update(tasks, "b2", store)
+    val res = Build.busy[String, Int].update(tasks, "b2", store)
     assert(res.getValue("b1") == 30)
     assert(res.getValue("b2") == 60)
   }
@@ -55,26 +63,13 @@ class BuildCartTest extends FunSuite {
         def hash(i: Int): Hash[Int] = IntHash(i)
       }
 
-    val shake = Build.shake[Id, String, Int]
-    val res1 = shake.update(tasks, "b2", store1)
+    val res1 = Build.shake[String, Int].update(tasks, "b2", store1)
     assert(res1.getValue("b1") == 30)
     assert(res1.getValue("b2") == 60)
     // rebuilding does not change the store
-    val res2 = shake.update(tasks, "b2", res1)
+    val res2 = Build.shake[String, Int].update(tasks, "b2", res1)
     assert(res2 == res1)
     assert(res2.getValue("b1") == 30)
     assert(res2.getValue("b2") == 60)
-
-    // Try running in Eval
-
-    val shakeEval = Build.shake[Eval, String, Int]
-    val res1e = shakeEval.update(tasks.absorb[Eval], "b2", store1).value
-    assert(res1e.getValue("b1") == 30)
-    assert(res1e.getValue("b2") == 60)
-    // rebuilding does not change the store
-    val res2e = shakeEval.update(tasks.absorb[Eval], "b2", res1e).value
-    assert(res2e == res1e)
-    assert(res2e.getValue("b1") == 30)
-    assert(res2e.getValue("b2") == 60)
   }
 }
